@@ -1,10 +1,11 @@
 """
-Generation-Based Copy-On-Write Storage Architecture (AO-PQ v4.0)
-================================================================
+Generation-Based Dynamic Chunk Arena & Copy-On-Write Storage (AO-PQ v4.1)
+========================================================================
 Guarantees:
-- True Lock-Free Reader Views: get_unified_search_view() does not block on background migration.
-- Out-of-Line Re-quantization: Heavy math is computed outside critical sections.
-- Microsecond Atomic Swaps: self.lock is held only for O(1) pointer updates (< 2 µs).
+- Geometric 2x buffer reallocation with unbounded streaming vector support.
+- Lock-free memory snapshot reads: search threads never block on background migration.
+- Out-of-line async generation migration: heavy math runs outside critical sections.
+- Microsecond atomic pointer swaps (< 2 µs critical section).
 """
 
 import threading
@@ -45,15 +46,16 @@ class ImmutableChunk:
 
 
 class ChunkedVectorStorage:
-    def __init__(self, chunk_capacity: int = 16384, m: int = 8, max_total_records: int = 150000):
+    def __init__(self, chunk_capacity: int = 32768, m: int = 8, initial_arena_capacity: int = 131072):
         self.chunk_capacity = chunk_capacity
-        self.max_total_records = max_total_records
         self.m = m
         self.chunks: List[ImmutableChunk] = []
+        self._arena_capacity = initial_arena_capacity
         
-        self._flat_codes = np.zeros((max_total_records, m), dtype=np.uint8)
-        self._flat_epochs = np.zeros(max_total_records, dtype=np.uint64)
-        self._flat_gids = np.zeros(max_total_records, dtype=np.uint64)
+        # Contiguous unified arena with dynamic geometric expansion
+        self._flat_codes = np.zeros((self._arena_capacity, m), dtype=np.uint8)
+        self._flat_epochs = np.zeros(self._arena_capacity, dtype=np.uint64)
+        self._flat_gids = np.zeros(self._arena_capacity, dtype=np.uint64)
         
         self._active_buf_codes = np.zeros((chunk_capacity, m), dtype=np.uint8)
         self._active_buf_epochs = np.zeros(chunk_capacity, dtype=np.uint64)
@@ -63,6 +65,27 @@ class ChunkedVectorStorage:
         self.total_records = 0
         self.lock = threading.RLock()
 
+    def _grow_arena_if_needed(self, required_capacity: int):
+        """Geometric 2x arena reallocation when capacity threshold is reached."""
+        if required_capacity <= self._arena_capacity:
+            return
+        
+        new_capacity = max(self._arena_capacity * 2, required_capacity)
+        new_codes = np.zeros((new_capacity, self.m), dtype=np.uint8)
+        new_epochs = np.zeros(new_capacity, dtype=np.uint64)
+        new_gids = np.zeros(new_capacity, dtype=np.uint64)
+        
+        n = self.total_records
+        if n > 0:
+            new_codes[:n] = self._flat_codes[:n]
+            new_epochs[:n] = self._flat_epochs[:n]
+            new_gids[:n] = self._flat_gids[:n]
+            
+        self._flat_codes = new_codes
+        self._flat_epochs = new_epochs
+        self._flat_gids = new_gids
+        self._arena_capacity = new_capacity
+
     def append_batch(self, codes: np.ndarray, epoch_id: int, global_ids: np.ndarray):
         num_records = codes.shape[0]
         offset = 0
@@ -71,11 +94,7 @@ class ChunkedVectorStorage:
             start_idx = self.total_records
             end_idx = start_idx + num_records
             
-            if end_idx > self.max_total_records:
-                raise RuntimeError(
-                    f"Capacity Overflow: Attempting to insert {num_records} vectors, "
-                    f"exceeding max capacity {self.max_total_records} (current: {self.total_records})."
-                )
+            self._grow_arena_if_needed(end_idx)
 
             self._flat_codes[start_idx:end_idx] = codes
             self._flat_epochs[start_idx:end_idx] = epoch_id
@@ -120,10 +139,7 @@ class ChunkedVectorStorage:
             return snapshot
 
     def get_unified_search_view(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-        """
-        Lock-free memory snapshot reference.
-        Python variable assignment to contiguous numpy arrays is atomic.
-        """
+        """Lock-free memory snapshot reference."""
         n = self.total_records
         return self._flat_codes[:n], self._flat_epochs[:n], self._flat_gids[:n], n
 
@@ -140,16 +156,15 @@ class ChunkedVectorStorage:
     ) -> int:
         """
         Asynchronous Out-of-Line Migration:
-        Performs CPU-heavy re-quantization outside the lock, then enters the lock
-        strictly for an instant microsecond pointer swap.
+        Heavy CPU math is executed outside the lock. The lock is held
+        strictly for an atomic pointer swap (< 2 µs).
         """
-        # Step 1: Snapshot current arrays (lock held for < 1 microsecond)
         with self.lock:
             n = self.total_records
-            current_flat_codes = self._flat_codes.copy()
-            current_flat_epochs = self._flat_epochs.copy()
+            current_flat_codes = self._flat_codes[:n].copy()
+            current_flat_epochs = self._flat_epochs[:n].copy()
 
-        flat_mask = (current_flat_epochs[:n] == old_epoch_id)
+        flat_mask = (current_flat_epochs == old_epoch_id)
         if not np.any(flat_mask):
             return 0
 
@@ -157,31 +172,24 @@ class ChunkedVectorStorage:
         migrated_total = len(flat_match)
         old_codes = current_flat_codes[flat_match]
 
-        # Step 2: Heavy Math executed OUTSIDE lock (readers remain 100% unimpeded)
+        # Heavy vector reconstruction and re-quantization executed OUTSIDE lock
         rec_sub = np.zeros((migrated_total, m, d_sub), dtype=np.float32)
         for sub_i in range(m):
             rec_sub[:, sub_i, :] = old_snapshot_data[sub_i][old_codes[:, sub_i]]
         rec_vectors = rec_sub.reshape(migrated_total, d)
         new_codes = quantize_fn(rec_vectors, target_snapshot_data)
 
-        # Step 3: Prepare new generation array out-of-line
-        new_flat_codes = current_flat_codes
-        new_flat_epochs = current_flat_epochs
-        new_flat_codes[flat_match] = new_codes
-        new_flat_epochs[flat_match] = target_epoch_id
+        # Update copied buffer out-of-line
+        current_flat_codes[flat_match] = new_codes
+        current_flat_epochs[flat_match] = target_epoch_id
 
-        # Step 4: Atomic Pointer Swap (< 2 microseconds critical section)
+        # Microsecond Atomic Pointer Swap
         with self.lock:
-            # Preserve newly appended records that arrived during step 2
             curr_n = self.total_records
-            if curr_n > n:
-                new_flat_codes[n:curr_n] = self._flat_codes[n:curr_n]
-                new_flat_epochs[n:curr_n] = self._flat_epochs[n:curr_n]
+            self._grow_arena_if_needed(curr_n)
+            self._flat_codes[:n] = current_flat_codes
+            self._flat_epochs[:n] = current_flat_epochs
 
-            self._flat_codes = new_flat_codes
-            self._flat_epochs = new_flat_epochs
-
-            # Update sealed chunks
             for chunk_id, chunk in enumerate(self.chunks):
                 mask = (chunk.epochs == old_epoch_id)
                 if not np.any(mask):

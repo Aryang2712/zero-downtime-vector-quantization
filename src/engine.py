@@ -1,12 +1,12 @@
 """
-Adaptive Online Product Quantization (AO-PQ) Engine - v3.7 Production Core
-==========================================================================
+Adaptive Online Product Quantization (AO-PQ) Engine - v4.1 Dynamic Core
+=======================================================================
 Features:
 - Immutable Codebook Snapshots with 64-bit Monotonic Epoch IDs.
-- Formal Epoch Lifecycle (PREPARING, ACTIVE, RETIRED, MIGRATING, RECLAIMABLE, PURGED).
-- Generation-Swapped COW Storage protecting in-flight searches.
-- Compiled SIMD ADC Scanner & Exact Refiner.
-- Robust Multi-Epoch Retry Recovery across both search() and search_adc_only().
+- Dynamic Chunk Arena Storage (geometric buffer expansion).
+- Thread-safe JIT Distance Scanning with GIL released (nogil=True).
+- Dual-Mode Search: search() (Two-Stage Refinement) & search_adc_only() (Pure ADC).
+- Robust drift thresholding with absolute delta guards.
 """
 
 import os
@@ -18,24 +18,24 @@ import enum
 import threading
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Set
-from numba import njit, prange
+from numba import njit
 from sklearn.cluster import MiniBatchKMeans
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.storage import ChunkedVectorStorage, ImmutableChunk
 
 
-@njit(fastmath=True, parallel=True)
+@njit(fastmath=True, nogil=True)
 def _fast_unified_multi_epoch_adc(codes, epochs, epoch_lut_matrix, epoch_id_map, m, k):
     """
-    Single-invocation SIMD-vectorized Multi-Epoch Distance Scanner.
-    Processes all N vectors in one continuous parallel sweep.
+    SIMD-vectorized Multi-Epoch Distance Scanner with GIL released.
+    Thread-safe for concurrent multi-reader access.
     """
     n = codes.shape[0]
     distances = np.empty(n, dtype=np.float32)
     num_epochs = epoch_id_map.shape[0]
 
-    for i in prange(n):
+    for i in range(n):
         e_id = epochs[i]
 
         lut_idx = -1
@@ -57,14 +57,14 @@ def _fast_unified_multi_epoch_adc(codes, epochs, epoch_lut_matrix, epoch_id_map,
     return distances
 
 
-@njit(fastmath=True, parallel=True)
+@njit(fastmath=True, nogil=True)
 def _fast_exact_rerank(candidate_vectors, query):
-    """Parallel Euclidean distance refinement on extracted candidates."""
+    """Euclidean distance refinement on extracted candidate vectors with GIL released."""
     k_cand = candidate_vectors.shape[0]
     d = candidate_vectors.shape[1]
     exact_dists = np.empty(k_cand, dtype=np.float32)
 
-    for i in prange(k_cand):
+    for i in range(k_cand):
         acc = 0.0
         for dim in range(d):
             diff = candidate_vectors[i, dim] - query[dim]
@@ -84,7 +84,7 @@ class EpochState(enum.Enum):
 
 
 class CodebookSnapshot:
-    """Immutable snapshot instance of a PQ codebook at a specific epoch generation."""
+    """Immutable snapshot of a PQ codebook at a specific epoch generation."""
     def __init__(self, epoch_id: int, centroids: np.ndarray):
         self.epoch_id = np.uint64(epoch_id)
         self._data = np.ascontiguousarray(centroids, dtype=np.float32).copy()
@@ -107,7 +107,6 @@ class EpochManager:
         self.registry: Dict[int, CodebookSnapshot] = {}
         self.epoch_states: Dict[int, EpochState] = {}
         self.ref_counts: Dict[int, int] = {}
-        self.active_readers: Dict[int, int] = {}
         self.active_epoch_id: int = 0
         self.lock = threading.RLock()
 
@@ -117,7 +116,6 @@ class EpochManager:
             self.registry[0] = snapshot
             self.epoch_states[0] = EpochState.ACTIVE
             self.ref_counts[0] = 0
-            self.active_readers[0] = 0
             self.active_epoch_id = 0
             return snapshot
 
@@ -125,7 +123,7 @@ class EpochManager:
         return CodebookSnapshot(next_epoch_id, codebook_data)
 
     def publish_promoted_snapshot(self, snapshot: CodebookSnapshot):
-        """Atomic publication critical section (O(1) pointer swap)."""
+        """Atomic publication critical section."""
         with self.lock:
             new_id = int(snapshot.epoch_id)
             prev_id = self.active_epoch_id
@@ -133,7 +131,6 @@ class EpochManager:
             self.registry[new_id] = snapshot
             self.epoch_states[new_id] = EpochState.ACTIVE
             self.ref_counts[new_id] = 0
-            self.active_readers[new_id] = 0
 
             if prev_id in self.epoch_states:
                 self.epoch_states[prev_id] = EpochState.RETIRED
@@ -141,7 +138,7 @@ class EpochManager:
             self.active_epoch_id = new_id
 
     def get_search_snapshot_view(self) -> Dict[int, CodebookSnapshot]:
-        """Provides an isolated immutable dictionary view of all live snapshots."""
+        """Provides an immutable dictionary view of all searchable snapshots."""
         with self.lock:
             searchable = {}
             for e_id, snap in self.registry.items():
@@ -167,8 +164,7 @@ class EpochManager:
     def _attempt_reclaim(self, epoch_id: int):
         with self.lock:
             if (self.epoch_states.get(epoch_id) == EpochState.RECLAIMABLE and 
-                self.ref_counts.get(epoch_id, 0) == 0 and 
-                self.active_readers.get(epoch_id, 0) == 0):
+                self.ref_counts.get(epoch_id, 0) == 0):
                 self.epoch_states[epoch_id] = EpochState.PURGED
                 if epoch_id in self.registry:
                     del self.registry[epoch_id]
@@ -191,8 +187,8 @@ class EpochManager:
 
 class AdaptiveOnlinePQ:
     """
-    Adaptive Online Product Quantization Engine (v3.7 Production Core).
-    Supports zero-downtime monotonic codebook replacement under streaming drift.
+    Adaptive Online Product Quantization Engine (v4.1 Dynamic Core).
+    Supports zero-downtime codebook replacement with dynamic arena storage.
     """
     def __init__(
         self,
@@ -203,8 +199,8 @@ class AdaptiveOnlinePQ:
         momentum: float = 0.85,
         drift_threshold: float = 0.015,
         max_active_window: int = 4,
-        chunk_capacity: int = 16384,
-        max_total_vectors: int = 150000
+        chunk_capacity: int = 32768,
+        initial_arena_capacity: int = 131072
     ):
         assert d % m == 0, f"Vector dimension {d} must be divisible by m={m}"
         self.d = d
@@ -216,9 +212,13 @@ class AdaptiveOnlinePQ:
         self.drift_threshold = drift_threshold
 
         self.epoch_manager = EpochManager(max_active_window=max_active_window)
-        self.storage = ChunkedVectorStorage(chunk_capacity=chunk_capacity, m=m, max_total_records=max_total_vectors)
+        self.storage = ChunkedVectorStorage(
+            chunk_capacity=chunk_capacity,
+            m=m,
+            initial_arena_capacity=initial_arena_capacity
+        )
 
-        self._raw_vector_store = np.zeros((max_total_vectors, d), dtype=np.float32)
+        self._raw_chunks: List[np.ndarray] = []
         self._raw_count = 0
         self._raw_lock = threading.Lock()
 
@@ -232,7 +232,7 @@ class AdaptiveOnlinePQ:
         self._migration_worker = threading.Thread(target=self._async_migration_loop, daemon=True)
         self._migration_worker.start()
 
-        # Pre-warm JIT kernels
+        # Warm up JIT kernels
         _d_codes = np.zeros((10, self.m), dtype=np.uint8)
         _d_epochs = np.zeros(10, dtype=np.uint64)
         _d_lut = np.zeros((1, self.m, self.k), dtype=np.float32)
@@ -324,10 +324,13 @@ class AdaptiveOnlinePQ:
 
         active_mse = self.compute_reconstruction_mse(X_batch, active_snapshot.data)
         shadow_mse = self.compute_reconstruction_mse(X_batch, self.shadow_codebook)
-        rel_gain = (active_mse - shadow_mse) / max(active_mse, 1e-6)
+        
+        mse_diff = active_mse - shadow_mse
+        rel_gain = mse_diff / max(active_mse, 1e-6)
 
-        # 3. Decoupled Promotion
-        if rel_gain > self.drift_threshold or force_swap:
+        # 3. Decoupled Promotion with stationary noise guard
+        is_significant_drift = (rel_gain > self.drift_threshold) and (mse_diff > 1e-4)
+        if is_significant_drift or force_swap:
             next_epoch_id = curr_active_id + 1
             prepared_snapshot = self.epoch_manager.prepare_snapshot(
                 next_epoch_id, self.shadow_codebook
@@ -340,13 +343,10 @@ class AdaptiveOnlinePQ:
             for cand in candidates:
                 self.migration_queue.put(cand)
 
-        # 4. Ingest raw vectors into pre-allocated memory
+        # 4. Ingest raw vectors into chunk list
         with self._raw_lock:
-            start_pos = self._raw_count
-            end_pos = start_pos + N_batch
-            if end_pos <= self._raw_vector_store.shape[0]:
-                self._raw_vector_store[start_pos:end_pos] = X_batch
-                self._raw_count = end_pos
+            self._raw_chunks.append(np.ascontiguousarray(X_batch, dtype=np.float32))
+            self._raw_count += N_batch
 
         # 5. Storage Append
         active_id = self.epoch_manager.active_epoch_id
@@ -396,10 +396,7 @@ class AdaptiveOnlinePQ:
         self.total_compactions += 1
 
     def search_adc_only(self, query: np.ndarray, top_k: int = 10) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Pure Multi-Epoch ADC search without second-stage refinement.
-        Features NaN detection and dynamic epoch snapshot reload retry.
-        """
+        """Pure Multi-Epoch ADC search without candidate refinement."""
         assert query.shape[0] == self.d, f"Query dimension mismatch: expected {self.d}"
         q_sub = query.reshape(self.m, self.d_sub)
 
@@ -421,7 +418,6 @@ class AdaptiveOnlinePQ:
             flat_codes, flat_epochs, epoch_lut_matrix, epoch_id_map, self.m, self.k
         )
 
-        # Dynamic retry recovery if a snapshot changed mid-flight
         if np.isnan(all_dists).any():
             active_snapshots = self.epoch_manager.get_search_snapshot_view()
             epoch_ids = list(active_snapshots.keys())
@@ -440,17 +436,22 @@ class AdaptiveOnlinePQ:
         sorted_order = top_indices[np.argsort(all_dists[top_indices])]
         return flat_gids[sorted_order], all_dists[sorted_order]
 
+    def _get_raw_vector(self, gid: int) -> np.ndarray:
+        """Retrieves raw vector from chunk list by global ID."""
+        curr = 0
+        for chunk in self._raw_chunks:
+            if gid < curr + chunk.shape[0]:
+                return chunk[gid - curr]
+            curr += chunk.shape[0]
+        raise IndexError(f"Global ID {gid} out of range in raw vector store.")
+
     def search(
         self,
         query: np.ndarray,
         top_k: int = 10,
         candidate_pool: int = 80
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Two-Stage High-Throughput Search:
-        - Candidate pool defaults to 80 (optimal balance: <0.02ms exact scan, >95% candidate recall).
-        - SIMD exact refinement extracts the exact Top-K.
-        """
+        """Two-stage search with multi-epoch ADC scan and Euclidean refinement."""
         assert query.shape[0] == self.d, f"Query dimension mismatch: expected {self.d}"
         q_sub = query.reshape(self.m, self.d_sub)
 
@@ -469,7 +470,6 @@ class AdaptiveOnlinePQ:
             for sub_i in range(self.m):
                 epoch_lut_matrix[slot, sub_i] = np.sum((cb_data[sub_i] - q_sub[sub_i]) ** 2, axis=1)
 
-        # 1. Single-Pass Parallel Scan over all N vectors
         all_dists = _fast_unified_multi_epoch_adc(
             flat_codes, flat_epochs, epoch_lut_matrix, epoch_id_map, self.m, self.k
         )
@@ -487,21 +487,21 @@ class AdaptiveOnlinePQ:
                 flat_codes, flat_epochs, epoch_lut_matrix, epoch_id_map, self.m, self.k
             )
 
-        # 2. Extract Candidate Pool
         candidate_k = min(max(top_k * 4, candidate_pool), total_n)
         candidate_indices = np.argpartition(all_dists, candidate_k - 1)[:candidate_k]
         candidate_ids = flat_gids[candidate_indices]
 
-        # 3. Exact SIMD Refinement
-        if self._raw_count >= candidate_ids.max():
-            candidate_vecs = self._raw_vector_store[candidate_ids]
-            exact_dists = _fast_exact_rerank(candidate_vecs, query)
+        # Exact Refinement on retrieved candidates
+        with self._raw_lock:
+            if candidate_ids.size > 0 and candidate_ids.max() < self._raw_count:
+                candidate_vecs = np.vstack([self._get_raw_vector(int(cid)) for cid in candidate_ids])
+                exact_dists = _fast_exact_rerank(candidate_vecs, query)
 
-            final_k = min(top_k, candidate_k)
-            best_local = np.argpartition(exact_dists, final_k - 1)[:final_k]
-            sorted_order = best_local[np.argsort(exact_dists[best_local])]
+                final_k = min(top_k, candidate_k)
+                best_local = np.argpartition(exact_dists, final_k - 1)[:final_k]
+                sorted_order = best_local[np.argsort(exact_dists[best_local])]
 
-            return candidate_ids[sorted_order], exact_dists[sorted_order]
+                return candidate_ids[sorted_order], exact_dists[sorted_order]
 
         final_k = min(top_k, candidate_k)
         sorted_order = candidate_indices[np.argsort(all_dists[candidate_indices])][:final_k]

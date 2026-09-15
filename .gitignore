@@ -1,9 +1,46 @@
-venv/
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-.DS_Store
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+.env
+.venv/
+venv/
+ENV/
+env/
+
+# Datasets and Large Binaries (Crucial for GitHub push limits)
 datasets/sift1m/
-datasets/sift1m/*
+datasets/*.fvecs
+datasets/*.ivecs
+datasets/*.tar.gz
 *.fvecs
 *.ivecs
 *.tar.gz
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride

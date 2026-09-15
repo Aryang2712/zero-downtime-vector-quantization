@@ -1,14 +1,15 @@
 """
-Streaming Baselines & Pure/Reranked Search Evaluation (AO-PQ v3.7)
+Streaming Baselines & Pure/Reranked Search Evaluation (AO-PQ v3.8)
 =================================================================
-Includes complete index coverage across sealed segments AND unsealed current_buf.
+Pre-quantizes unsealed buffer codes during ingest() to guarantee 
+pure, matched ADC latency comparison during search().
 """
 
 import os
 import sys
 import time
 import numpy as np
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from sklearn.cluster import MiniBatchKMeans
 
 
@@ -94,7 +95,7 @@ class StaticPQBaseline:
 class SegmentedPQBaseline:
     """
     Segmented PQ Baseline with Scatter-Gather Search Scanning.
-    Guarantees full index coverage by querying sealed segments AND unsealed current_buf.
+    Pre-quantizes all ingested vectors to ensure zero query-time quantization penalty.
     """
     def __init__(self, d: int = 128, m: int = 8, k: int = 256, segment_size: int = 5000):
         self.d = d
@@ -103,44 +104,51 @@ class SegmentedPQBaseline:
         self.k = k
         self.segment_size = segment_size
         self.segments: List[Tuple[np.ndarray, np.ndarray]] = []
-        self.current_buf: List[np.ndarray] = []
-        self.current_buf_centroids: Optional[np.ndarray] = None
+        self.current_buf_vectors: List[np.ndarray] = []
+        self.current_buf_codes: List[np.ndarray] = []
+        self.active_codebook: Optional[np.ndarray] = None
         self.total_records = 0
 
     def _decompose(self, X: np.ndarray) -> np.ndarray:
         return np.ascontiguousarray(X.reshape(X.shape[0], self.m, self.d_sub))
 
-    def ingest(self, X_batch: np.ndarray):
-        self.current_buf.append(X_batch)
-        buf_len = sum(b.shape[0] for b in self.current_buf)
-        
-        if buf_len >= self.segment_size:
-            seg_data = np.vstack(self.current_buf)
-            static_seg = StaticPQBaseline(self.d, self.m, self.k)
-            static_seg.fit(seg_data)
-            static_seg.ingest(seg_data)
-            self.segments.append((static_seg.centroids, np.vstack(static_seg.codes)))
-            self.current_buf = []
-            self.current_buf_centroids = None
-        else:
-            # Maintain active sub-centroid view for unsealed buffer
-            buf_data = np.vstack(self.current_buf)
-            if buf_data.shape[0] >= self.k:
-                static_active = StaticPQBaseline(self.d, self.m, self.k)
-                static_active.fit(buf_data)
-                self.current_buf_centroids = static_active.centroids
-            elif len(self.segments) > 0:
-                self.current_buf_centroids = self.segments[-1][0]
-            else:
-                self.current_buf_centroids = np.zeros((self.m, self.k, self.d_sub), dtype=np.float32)
+    def _quantize_with(self, X: np.ndarray, centroids: np.ndarray) -> np.ndarray:
+        X_sub = self._decompose(X)
+        N = X.shape[0]
+        codes = np.zeros((N, self.m), dtype=np.uint8)
+        for i in range(self.m):
+            sub_vecs = X_sub[:, i, :]
+            c = centroids[i]
+            dists = np.sum(sub_vecs**2, axis=1, keepdims=True) + np.sum(c**2, axis=1, keepdims=True).T - 2.0 * np.dot(sub_vecs, c.T)
+            codes[:, i] = np.argmin(dists, axis=1)
+        return codes
 
+    def ingest(self, X_batch: np.ndarray):
+        # Set initial codebook if empty
+        if self.active_codebook is None:
+            static_init = StaticPQBaseline(self.d, self.m, self.k)
+            static_init.fit(X_batch)
+            self.active_codebook = static_init.centroids
+
+        # Pre-quantize during ingest
+        batch_codes = self._quantize_with(X_batch, self.active_codebook)
+        self.current_buf_vectors.append(X_batch)
+        self.current_buf_codes.append(batch_codes)
         self.total_records += X_batch.shape[0]
 
+        buf_len = sum(b.shape[0] for b in self.current_buf_vectors)
+        if buf_len >= self.segment_size:
+            seg_data = np.vstack(self.current_buf_vectors)
+            static_seg = StaticPQBaseline(self.d, self.m, self.k)
+            static_seg.fit(seg_data)
+            seg_codes = static_seg.quantize(seg_data)
+            self.segments.append((static_seg.centroids, seg_codes))
+            self.active_codebook = static_seg.centroids
+            self.current_buf_vectors = []
+            self.current_buf_codes = []
+
     def search(self, query: np.ndarray, top_k: int = 10) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Scatter-gather multi-segment search scan across ALL indexed vectors
-        (Sealed Segments + Active Buffer).
-        """
+        """Pure ADC scatter-gather search over pre-quantized codes."""
         if self.total_records == 0:
             return np.array([], dtype=np.uint64), np.array([], dtype=np.float32)
 
@@ -163,23 +171,13 @@ class SegmentedPQBaseline:
             all_ids.append(np.arange(curr_offset, curr_offset + n_seg, dtype=np.uint64))
             curr_offset += n_seg
 
-        # 2. Scan Unsealed Current Buffer (Ensures 100% vector coverage)
-        if len(self.current_buf) > 0:
-            buf_data = np.vstack(self.current_buf)
-            n_buf = buf_data.shape[0]
-            buf_sub = self._decompose(buf_data)
-            
-            c_buf = self.current_buf_centroids if self.current_buf_centroids is not None else np.zeros((self.m, self.k, self.d_sub), dtype=np.float32)
+        # 2. Scan Pre-Quantized Unsealed Active Buffer
+        if len(self.current_buf_codes) > 0:
+            buf_codes = np.vstack(self.current_buf_codes)
+            n_buf = buf_codes.shape[0]
             lut = np.zeros((self.m, self.k), dtype=np.float32)
             for i in range(self.m):
-                lut[i] = np.sum((c_buf[i] - q_sub[i]) ** 2, axis=1)
-
-            # Quantize unsealed batch
-            buf_codes = np.zeros((n_buf, self.m), dtype=np.uint8)
-            for i in range(self.m):
-                sub_vecs = buf_sub[:, i, :]
-                dists_c = np.sum(sub_vecs**2, axis=1, keepdims=True) + np.sum(c_buf[i]**2, axis=1, keepdims=True).T - 2.0 * np.dot(sub_vecs, c_buf[i].T)
-                buf_codes[:, i] = np.argmin(dists_c, axis=1)
+                lut[i] = np.sum((self.active_codebook[i] - q_sub[i]) ** 2, axis=1)
 
             buf_dists = np.zeros(n_buf, dtype=np.float32)
             for j in range(self.m):
