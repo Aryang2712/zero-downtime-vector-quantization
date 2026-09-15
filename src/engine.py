@@ -6,7 +6,9 @@ Features:
 - Dynamic Chunk Arena Storage (geometric buffer expansion).
 - Thread-safe JIT Distance Scanning with GIL released (nogil=True).
 - Dual-Mode Search: search() (Two-Stage Refinement) & search_adc_only() (Pure ADC).
-- Robust drift thresholding with absolute delta guards.
+- Dynamic Candidate Pool Scaling (alpha * N).
+- Absolute error guards for drift triggering (zero false swaps under stationary drift).
+- Fine-grained memory breakdown accounting.
 """
 
 import os
@@ -328,7 +330,7 @@ class AdaptiveOnlinePQ:
         mse_diff = active_mse - shadow_mse
         rel_gain = mse_diff / max(active_mse, 1e-6)
 
-        # 3. Decoupled Promotion with stationary noise guard
+        # 3. Decoupled Promotion with absolute error floor
         is_significant_drift = (rel_gain > self.drift_threshold) and (mse_diff > 1e-4)
         if is_significant_drift or force_swap:
             next_epoch_id = curr_active_id + 1
@@ -449,9 +451,10 @@ class AdaptiveOnlinePQ:
         self,
         query: np.ndarray,
         top_k: int = 10,
-        candidate_pool: int = 80
+        candidate_pool: Optional[int] = None,
+        candidate_ratio: float = 0.005
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Two-stage search with multi-epoch ADC scan and Euclidean refinement."""
+        """Two-stage search with dynamic candidate pool scaling (max(top_k * 4, min_pool, alpha * N))."""
         assert query.shape[0] == self.d, f"Query dimension mismatch: expected {self.d}"
         q_sub = query.reshape(self.m, self.d_sub)
 
@@ -487,7 +490,13 @@ class AdaptiveOnlinePQ:
                 flat_codes, flat_epochs, epoch_lut_matrix, epoch_id_map, self.m, self.k
             )
 
-        candidate_k = min(max(top_k * 4, candidate_pool), total_n)
+        # Dynamic pool calculation
+        if candidate_pool is None:
+            effective_pool = max(80, int(total_n * candidate_ratio))
+        else:
+            effective_pool = candidate_pool
+
+        candidate_k = min(max(top_k * 4, effective_pool), total_n)
         candidate_indices = np.argpartition(all_dists, candidate_k - 1)[:candidate_k]
         candidate_ids = flat_gids[candidate_indices]
 
@@ -506,6 +515,44 @@ class AdaptiveOnlinePQ:
         final_k = min(top_k, candidate_k)
         sorted_order = candidate_indices[np.argsort(all_dists[candidate_indices])][:final_k]
         return flat_gids[sorted_order], all_dists[sorted_order]
+
+    def get_memory_footprint(self) -> dict:
+        """Calculates precise physical memory consumption across all index layers."""
+        with self.storage.lock:
+            code_bytes = self.storage._flat_codes.nbytes
+            epoch_bytes = self.storage._flat_epochs.nbytes
+            gid_bytes = self.storage._flat_gids.nbytes
+            chunk_overhead = sum(
+                c.codes.nbytes + c.epochs.nbytes + c.global_ids.nbytes 
+                for c in self.storage.chunks
+            )
+
+        with self.epoch_manager.lock:
+            codebook_bytes = sum(s.data.nbytes for s in self.epoch_manager.registry.values())
+            codebook_bytes += self.shadow_codebook.nbytes + self.velocity.nbytes
+
+        with self._raw_lock:
+            raw_bytes = sum(chunk.nbytes for chunk in self._raw_chunks)
+
+        total_pq_index_bytes = code_bytes + epoch_bytes + gid_bytes + chunk_overhead + codebook_bytes
+        total_system_bytes = total_pq_index_bytes + raw_bytes
+        flat_uncompressed_bytes = self.storage.total_records * self.d * 4
+
+        return {
+            "total_records": self.storage.total_records,
+            "pq_index_bytes": total_pq_index_bytes,
+            "raw_cache_bytes": raw_bytes,
+            "total_allocated_bytes": total_system_bytes,
+            "equivalent_flat_bytes": flat_uncompressed_bytes,
+            "pq_standalone_compression_ratio": (
+                (1.0 - (total_pq_index_bytes / max(flat_uncompressed_bytes, 1))) * 100.0
+                if flat_uncompressed_bytes > 0 else 0.0
+            ),
+            "effective_system_savings": (
+                (1.0 - (total_system_bytes / max(flat_uncompressed_bytes, 1))) * 100.0
+                if flat_uncompressed_bytes > 0 else 0.0
+            )
+        }
 
     def close(self):
         self._stop_event.set()

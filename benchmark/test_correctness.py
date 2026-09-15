@@ -122,18 +122,14 @@ def run_comprehensive_audit():
     assert len(o_ids) == total_n, "Test 15 Failed."
     print("  --> PASS: Robust boundary handling on empty and over-requested Top-K.")
 
-    # [TEST 16-17/17] Rapid Shift & Stationary Workload Invariants
+    # [TEST 16-17/17] Rapid Shift & Stationary Workload Invariants (Isolated)
     print("[TEST 16-17/17] Rapid Shift & Stationary Workload Invariants...")
     engine_stat = AdaptiveOnlinePQ(d=d, m=m, k=k, drift_threshold=0.05)
-    # Generate stationary corpus from constant distribution
     X_stat_pool = np.random.randn(10000, d).astype(np.float32)
     engine_stat.fit_initial(X_stat_pool[:4000])
-    
-    # Pre-ingest to stabilize velocity & shadow codebook
     engine_stat.ingest_stream_batch(X_stat_pool[:2000], force_swap=False)
 
     swaps_before = engine_stat.total_swaps
-    # Feed batches from the exact same stationary pool (sample size > k=256)
     for b_idx in range(5):
         batch = X_stat_pool[2000 + b_idx * 1000 : 2000 + (b_idx + 1) * 1000]
         engine_stat.ingest_stream_batch(batch, force_swap=False)
@@ -146,8 +142,6 @@ def run_comprehensive_audit():
     engine_stat.close()
     engine.close()
     empty_engine.close()
-
-
     print("\n" + "=" * 75)
     print(" [AUDIT SUCCESS] ALL 17 IMPLEMENTED TEST CASES PASSED")
     print("=" * 75)

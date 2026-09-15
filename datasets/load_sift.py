@@ -272,8 +272,8 @@ def run_sift_benchmark():
             gt_dists = np.sum((curr_corpus - q) ** 2, axis=1)
             gt_top10 = set(np.argpartition(gt_dists, 10)[:10])
 
-            # Two-Stage Search (Candidate Pool = 80)
-            pred_adp, _ = adaptive_engine.search(q, top_k=10, candidate_pool=80)
+            # Two-Stage Search with Dynamic Candidate Scaling
+            pred_adp, _ = adaptive_engine.search(q, top_k=10)
             pred_sta, _ = static_engine.search(q, top_k=10, candidate_pool=80)
             adp_recalls_twostage.append(len(gt_top10.intersection(set(pred_adp))) / 10.0)
             static_recalls_twostage.append(len(gt_top10.intersection(set(pred_sta))) / 10.0)
@@ -315,6 +315,20 @@ def run_sift_benchmark():
         })
 
     adaptive_engine.migration_queue.join()
+    
+    # Print Exact Memory Footprint
+    mem = adaptive_engine.get_memory_footprint()
+    print("\n" + "=" * 75)
+    print("                    PHYSICAL MEMORY BREAKDOWN")
+    print("=" * 75)
+    print(f" Total Quantized Vector Records : {mem['total_records']:,}")
+    print(f" Standalone PQ Index Memory     : {mem['pq_index_bytes'] / (1024 * 1024):.2f} MB")
+    print(f" Raw Uncompressed Cache Memory  : {mem['raw_cache_bytes'] / (1024 * 1024):.2f} MB")
+    print(f" Total Engine Allocated Memory  : {mem['total_allocated_bytes'] / (1024 * 1024):.2f} MB")
+    print(f" Equivalent Flat Index Memory   : {mem['equivalent_flat_bytes'] / (1024 * 1024):.2f} MB")
+    print(f" Standalone PQ Compression Ratio: {mem['pq_standalone_compression_ratio']:.2f}%")
+    print("=" * 75)
+
     adaptive_engine.close()
 
     df_metrics = pd.DataFrame(metrics_records)

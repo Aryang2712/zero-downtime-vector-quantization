@@ -5,7 +5,8 @@ Guarantees:
 - Geometric 2x buffer reallocation with unbounded streaming vector support.
 - Lock-free memory snapshot reads: search threads never block on background migration.
 - Out-of-line async generation migration: heavy math runs outside critical sections.
-- Microsecond atomic pointer swaps (< 2 µs critical section).
+- Microsecond atomic reference pointer swaps (True O(1) swap).
+- Pruned sealed chunk scanning using get_referenced_epochs().
 """
 
 import threading
@@ -155,16 +156,16 @@ class ChunkedVectorStorage:
         d_sub: int
     ) -> int:
         """
-        Asynchronous Out-of-Line Migration:
-        Heavy CPU math is executed outside the lock. The lock is held
-        strictly for an atomic pointer swap (< 2 µs).
+        Asynchronous Out-of-Line Migration with True O(1) Atomic Reference Pointer Swap.
+        Heavy compute runs outside the critical lock section.
         """
         with self.lock:
             n = self.total_records
-            current_flat_codes = self._flat_codes[:n].copy()
-            current_flat_epochs = self._flat_epochs[:n].copy()
+            current_flat_codes = self._flat_codes.copy()
+            current_flat_epochs = self._flat_epochs.copy()
+            current_chunks = list(self.chunks)
 
-        flat_mask = (current_flat_epochs == old_epoch_id)
+        flat_mask = (current_flat_epochs[:n] == old_epoch_id)
         if not np.any(flat_mask):
             return 0
 
@@ -183,36 +184,48 @@ class ChunkedVectorStorage:
         current_flat_codes[flat_match] = new_codes
         current_flat_epochs[flat_match] = target_epoch_id
 
-        # Microsecond Atomic Pointer Swap
-        with self.lock:
-            curr_n = self.total_records
-            self._grow_arena_if_needed(curr_n)
-            self._flat_codes[:n] = current_flat_codes
-            self._flat_epochs[:n] = current_flat_epochs
+        # Update sealed chunks out-of-line with get_referenced_epochs() pruning
+        updated_chunks = []
+        for chunk in current_chunks:
+            if old_epoch_id not in chunk.get_referenced_epochs():
+                updated_chunks.append(chunk)
+                continue
 
-            for chunk_id, chunk in enumerate(self.chunks):
-                mask = (chunk.epochs == old_epoch_id)
-                if not np.any(mask):
-                    continue
-                m_indices = np.flatnonzero(mask)
-                mut_codes = chunk.codes.copy()
-                mut_epochs = chunk.epochs.copy()
+            mask = (chunk.epochs == old_epoch_id)
+            m_indices = np.flatnonzero(mask)
+            mut_codes = chunk.codes.copy()
+            mut_epochs = chunk.epochs.copy()
 
-                c_old = chunk.codes[m_indices]
-                c_rec_sub = np.zeros((len(m_indices), m, d_sub), dtype=np.float32)
-                for sub_i in range(m):
-                    c_rec_sub[:, sub_i, :] = old_snapshot_data[sub_i][c_old[:, sub_i]]
-                c_new = quantize_fn(c_rec_sub.reshape(len(m_indices), d), target_snapshot_data)
+            c_old = chunk.codes[m_indices]
+            c_rec_sub = np.zeros((len(m_indices), m, d_sub), dtype=np.float32)
+            for sub_i in range(m):
+                c_rec_sub[:, sub_i, :] = old_snapshot_data[sub_i][c_old[:, sub_i]]
+            c_new = quantize_fn(c_rec_sub.reshape(len(m_indices), d), target_snapshot_data)
 
-                mut_codes[m_indices] = c_new
-                mut_epochs[m_indices] = target_epoch_id
+            mut_codes[m_indices] = c_new
+            mut_epochs[m_indices] = target_epoch_id
 
-                self.chunks[chunk_id] = ImmutableChunk(
+            updated_chunks.append(
+                ImmutableChunk(
                     chunk_id=chunk.chunk_id,
                     codes=mut_codes,
                     epochs=mut_epochs,
                     global_ids=chunk.global_ids,
                     version=chunk.version + 1
                 )
+            )
+
+        # True O(1) Atomic Reference Pointer Swap
+        with self.lock:
+            # Re-apply any appends that arrived concurrently during out-of-line compute
+            if self.total_records > n:
+                current_flat_codes[n:self.total_records] = self._flat_codes[n:self.total_records]
+                current_flat_epochs[n:self.total_records] = self._flat_epochs[n:self.total_records]
+                for c in self.chunks[len(current_chunks):]:
+                    updated_chunks.append(c)
+
+            self._flat_codes = current_flat_codes
+            self._flat_epochs = current_flat_epochs
+            self.chunks = updated_chunks
 
         return migrated_total
