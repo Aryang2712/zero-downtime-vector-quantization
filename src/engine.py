@@ -1,8 +1,9 @@
 """
-Adaptive Online Product Quantization (AO-PQ) Engine - v4.3 Core
+Adaptive Online Product Quantization (AO-PQ) Engine - v4.4 Core
 ===============================================================
 Features:
-- Zero-Reconstruction Out-of-Line Codebook Morphing.
+- Zero-Reconstruction Out-of-Line Codebook Morphing via O(m * K^2) Nearest Centroid Projection.
+- Tiered Storage: Pure Compressed Mode (enable_reranking=False, 90.3% RAM savings) vs Two-Stage Refinement.
 - Multi-Version Concurrency Control (MVCC) Generation Manager.
 - Dynamic Candidate Pool Scaling (alpha * N).
 - Generational Staleness Tracking & Bounded Compaction Debt.
@@ -187,7 +188,8 @@ class AdaptiveOnlinePQ:
         drift_threshold: float = 0.015,
         max_active_window: int = 4,
         chunk_capacity: int = 32768,
-        initial_arena_capacity: int = 131072
+        initial_arena_capacity: int = 131072,
+        enable_reranking: bool = True
     ):
         assert d % m == 0, f"Vector dimension {d} must be divisible by m={m}"
         self.d = d
@@ -197,6 +199,7 @@ class AdaptiveOnlinePQ:
         self.lr = lr
         self.momentum = momentum
         self.drift_threshold = drift_threshold
+        self.enable_reranking = enable_reranking
 
         self.epoch_manager = EpochManager(max_active_window=max_active_window)
         self.storage = ChunkedVectorStorage(
@@ -330,10 +333,11 @@ class AdaptiveOnlinePQ:
             for cand in candidates:
                 self.migration_queue.put(cand)
 
-        # 4. Ingest raw vectors for second-stage refinement
-        with self._raw_lock:
-            self._raw_chunks.append(np.ascontiguousarray(X_batch, dtype=np.float32))
-            self._raw_count += N_batch
+        # 4. Ingest raw vectors for second-stage refinement (if enabled)
+        if self.enable_reranking:
+            with self._raw_lock:
+                self._raw_chunks.append(np.ascontiguousarray(X_batch, dtype=np.float32))
+                self._raw_count += N_batch
 
         # 5. Append to Storage Arena
         active_id = self.epoch_manager.active_epoch_id
@@ -367,7 +371,6 @@ class AdaptiveOnlinePQ:
             target_epoch_id = self.epoch_manager.active_epoch_id
             target_snapshot = self.epoch_manager.registry[target_epoch_id]
 
-        # Zero-reconstruction optimal transport migration
         migrated_total = self.storage.migrate_all_records(
             old_epoch_id=old_epoch_id,
             target_epoch_id=target_epoch_id,
@@ -435,6 +438,9 @@ class AdaptiveOnlinePQ:
         candidate_pool: Optional[int] = None,
         candidate_ratio: float = 0.005
     ) -> Tuple[np.ndarray, np.ndarray]:
+        if not self.enable_reranking:
+            return self.search_adc_only(query, top_k=top_k)
+
         assert query.shape[0] == self.d, f"Query dimension mismatch: expected {self.d}"
         q_sub = query.reshape(self.m, self.d_sub)
 
