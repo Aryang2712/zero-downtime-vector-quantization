@@ -1,9 +1,9 @@
 """
-SIFT-1M Full 1,000,000 Vector Streaming Benchmark (AO-PQ v4.2 MVCC Edition)
+SIFT-1M Full 1,000,000 Vector Streaming Benchmark (AO-PQ v4.4 MVCC Edition)
 ===========================================================================
 Evaluates continuous streaming drift across 1,000,000 SIFT vectors against:
 - Static PQ Baseline
-- Blue-Green Dual Index Rebuild Baseline (Industry Standard)
+- Blue-Green Dual Index Rebuild Baseline (with random sampling over full accumulated corpus)
 - Generational Staleness Tracking (Property 3 Verification)
 """
 
@@ -150,7 +150,7 @@ class StaticPQEngine:
 class BlueGreenRebuildBaseline:
     """
     Industry-standard baseline: Serves queries from Index A while 
-    training and rebuilding Index B in the background, doubling peak RAM.
+    training and rebuilding Index B in the background on fresh sampled vectors.
     """
     def __init__(self, d: int = 128, m: int = 8, k: int = 256):
         self.d = d
@@ -174,11 +174,15 @@ class BlueGreenRebuildBaseline:
         if rebuild:
             t0 = time.perf_counter()
             all_vecs = np.vstack(self.accumulated_vectors)
-            # Memory doubles during background training
-            peak_memory_mb *= 2.0
+            peak_memory_mb *= 2.0  # Blue-Green memory spike: 2x index size
+            
+            # Sample uniformly from the full accumulated pool
+            sample_size = min(100000, len(all_vecs))
+            sample_idx = np.random.choice(len(all_vecs), size=sample_size, replace=False)
+            train_sample = all_vecs[sample_idx]
             
             shadow_index = StaticPQEngine(self.d, self.m, self.k)
-            shadow_index.fit(all_vecs[:min(100000, len(all_vecs))])
+            shadow_index.fit(train_sample)
             for chunk in self.accumulated_vectors:
                 shadow_index.ingest(chunk)
             
@@ -193,7 +197,7 @@ class BlueGreenRebuildBaseline:
 
 def run_sift_benchmark():
     print("=" * 75)
-    print("      SIFT-1M STREAMING BENCHMARK (AO-PQ v4.2 MVCC PROTOCOL)")
+    print("      SIFT-1M STREAMING BENCHMARK (AO-PQ v4.4 MVCC PROTOCOL)")
     print("=" * 75)
     raw_sift = download_sift1m()
     
@@ -356,7 +360,7 @@ def run_sift_benchmark():
     plt.savefig("results/sift_fig2_recall_retention.png", dpi=300)
     plt.close()
 
-    # Figure 3: Generational Staleness Tracking (Property 3 Verification)
+    # Figure 5: Generational Staleness Tracking (Property 3 Verification)
     plt.figure(figsize=(8, 4))
     plt.plot(df_metrics["Batch"], df_metrics["Pct_Stale_Records"], label="Records Stale > 1 Epoch (%)", color="#d9534f", linewidth=2.0)
     plt.axhline(5.0, color="gray", linestyle=":", label="Staleness Ceiling (5%)")

@@ -1,35 +1,35 @@
 """
-Generation-Based Dynamic Chunk Arena & Zero-Reconstruction COW Storage (AO-PQ v4.3)
+Generation-Based Dynamic Chunk Arena & Zero-Reconstruction COW Storage (AO-PQ v4.4)
 ===================================================================================
 Guarantees:
-- O(K^2) Optimal Transport Codebook Morphing via discrete centroid alignment (Zero vector decoding).
+- True O(m * K^2) Nearest-Centroid Discrete Morphing (Zero vector decoding, allows many-to-one cluster mapping).
 - Geometric 2x buffer reallocation with unbounded streaming vector support.
 - Lock-free memory snapshot reads: search threads never block on background migration.
 - Zero-allocation read-slice references inside locks (< 1µs acquisition).
-- Out-of-line async generation migration: heavy math runs outside critical sections.
 - Microsecond atomic reference pointer swaps (True O(1) swap).
 - Pruned sealed chunk scanning using get_referenced_epochs().
 """
 
 import threading
 import numpy as np
-from typing import List, Tuple, Set, Callable, Optional
-from scipy.optimize import linear_sum_assignment
+from typing import List, Tuple, Set
 
 
 def compute_centroid_transition_map(old_centroids: np.ndarray, new_centroids: np.ndarray, m: int, k: int) -> np.ndarray:
     """
-    Computes an optimal O(K^2) discrete centroid transition matrix M[subspace, old_code] -> new_code
-    using the Hungarian algorithm (Linear Sum Assignment) to minimize transportation distortion.
+    Computes a true O(m * K^2) many-to-one discrete centroid transition matrix 
+    M[subspace, old_code] -> new_code via direct nearest centroid projection.
     """
     transition_map = np.empty((m, k), dtype=np.uint8)
     for sub_i in range(m):
-        c_old = old_centroids[sub_i]
-        c_new = new_centroids[sub_i]
-        # Pairwise squared Euclidean distance matrix between K old and K new centroids (256x256)
+        c_old = old_centroids[sub_i]  # Shape: (K, d_sub)
+        c_new = new_centroids[sub_i]  # Shape: (K, d_sub)
+        
+        # Pairwise squared Euclidean distance matrix (K x K)
         cost_matrix = np.sum((c_old[:, None, :] - c_new[None, :, :]) ** 2, axis=2)
-        old_idx, new_idx = linear_sum_assignment(cost_matrix)
-        transition_map[sub_i, old_idx] = new_idx.astype(np.uint8)
+        # Many-to-one projection: map each old centroid to its closest new centroid
+        transition_map[sub_i] = np.argmin(cost_matrix, axis=1).astype(np.uint8)
+        
     return transition_map
 
 
@@ -72,7 +72,6 @@ class ChunkedVectorStorage:
         self.chunks: List[ImmutableChunk] = []
         self._arena_capacity = initial_arena_capacity
         
-        # Contiguous unified arena with dynamic geometric expansion
         self._flat_codes = np.zeros((self._arena_capacity, m), dtype=np.uint8)
         self._flat_epochs = np.zeros(self._arena_capacity, dtype=np.uint64)
         self._flat_gids = np.zeros(self._arena_capacity, dtype=np.uint64)
@@ -86,7 +85,6 @@ class ChunkedVectorStorage:
         self.lock = threading.RLock()
 
     def _grow_arena_if_needed(self, required_capacity: int):
-        """Geometric 2x arena reallocation when capacity threshold is reached."""
         if required_capacity <= self._arena_capacity:
             return
         
@@ -159,7 +157,6 @@ class ChunkedVectorStorage:
             return snapshot
 
     def get_unified_search_view(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-        """Lock-free memory snapshot reference."""
         n = self.total_records
         return self._flat_codes[:n], self._flat_epochs[:n], self._flat_gids[:n], n
 
@@ -171,10 +168,6 @@ class ChunkedVectorStorage:
         target_snapshot_data: np.ndarray,
         k: int = 256
     ) -> int:
-        """
-        Zero-Reconstruction Asynchronous Migration via Optimal Transport Alignment.
-        Translates stored codes directly via O(K^2) discrete transition lookups at line speed.
-        """
         with self.lock:
             n = self.total_records
             view_codes = self._flat_codes[:n]
@@ -188,18 +181,18 @@ class ChunkedVectorStorage:
         flat_match = np.flatnonzero(flat_mask)
         migrated_total = len(flat_match)
 
-        # 1. Compute Optimal Transport Transition Matrix M[m, k] -> O(K^2)
+        # 1. Compute true O(m * K^2) Nearest-Centroid Transition Matrix
         transition_map = compute_centroid_transition_map(
             old_snapshot_data, target_snapshot_data, self.m, k
         )
 
-        # 2. Direct Vectorized Code Morphing (Zero Vector Reconstruction)
+        # 2. Vectorized 1D byte-lookup translation
         old_codes = view_codes[flat_match]
         new_codes = np.empty_like(old_codes)
         for sub_i in range(self.m):
             new_codes[:, sub_i] = transition_map[sub_i, old_codes[:, sub_i]]
 
-        # 3. Update sealed chunks out-of-line with get_referenced_epochs() pruning
+        # 3. Sealed chunk translation with get_referenced_epochs() pruning
         updated_chunks = []
         for chunk in current_chunks:
             if old_epoch_id not in chunk.get_referenced_epochs():
@@ -229,13 +222,13 @@ class ChunkedVectorStorage:
                 )
             )
 
-        # 4. Prepare new flat memory arena out-of-line
+        # 4. Out-of-line arena copy preparation
         new_flat_codes = self._flat_codes.copy()
         new_flat_epochs = self._flat_epochs.copy()
         new_flat_codes[flat_match] = new_codes
         new_flat_epochs[flat_match] = target_epoch_id
 
-        # 5. True O(1) Atomic Reference Pointer Swap
+        # 5. Atomic O(1) pointer swap
         with self.lock:
             if self.total_records > n:
                 new_flat_codes[n:self.total_records] = self._flat_codes[n:self.total_records]
