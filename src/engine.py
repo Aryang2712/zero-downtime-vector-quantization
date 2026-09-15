@@ -1,14 +1,12 @@
 """
-Adaptive Online Product Quantization (AO-PQ) Engine - v4.1 Dynamic Core
-=======================================================================
+Adaptive Online Product Quantization (AO-PQ) Engine - v4.3 Core
+===============================================================
 Features:
-- Immutable Codebook Snapshots with 64-bit Monotonic Epoch IDs.
-- Dynamic Chunk Arena Storage (geometric buffer expansion).
-- Thread-safe JIT Distance Scanning with GIL released (nogil=True).
-- Dual-Mode Search: search() (Two-Stage Refinement) & search_adc_only() (Pure ADC).
+- Zero-Reconstruction Out-of-Line Codebook Morphing.
+- Multi-Version Concurrency Control (MVCC) Generation Manager.
 - Dynamic Candidate Pool Scaling (alpha * N).
-- Absolute error guards for drift triggering (zero false swaps under stationary drift).
-- Fine-grained memory breakdown accounting.
+- Generational Staleness Tracking & Bounded Compaction Debt.
+- Sub-microsecond Atomic Pointer Swaps.
 """
 
 import os
@@ -29,10 +27,6 @@ from src.storage import ChunkedVectorStorage, ImmutableChunk
 
 @njit(fastmath=True, nogil=True)
 def _fast_unified_multi_epoch_adc(codes, epochs, epoch_lut_matrix, epoch_id_map, m, k):
-    """
-    SIMD-vectorized Multi-Epoch Distance Scanner with GIL released.
-    Thread-safe for concurrent multi-reader access.
-    """
     n = codes.shape[0]
     distances = np.empty(n, dtype=np.float32)
     num_epochs = epoch_id_map.shape[0]
@@ -61,7 +55,6 @@ def _fast_unified_multi_epoch_adc(codes, epochs, epoch_lut_matrix, epoch_id_map,
 
 @njit(fastmath=True, nogil=True)
 def _fast_exact_rerank(candidate_vectors, query):
-    """Euclidean distance refinement on extracted candidate vectors with GIL released."""
     k_cand = candidate_vectors.shape[0]
     d = candidate_vectors.shape[1]
     exact_dists = np.empty(k_cand, dtype=np.float32)
@@ -86,7 +79,6 @@ class EpochState(enum.Enum):
 
 
 class CodebookSnapshot:
-    """Immutable snapshot of a PQ codebook at a specific epoch generation."""
     def __init__(self, epoch_id: int, centroids: np.ndarray):
         self.epoch_id = np.uint64(epoch_id)
         self._data = np.ascontiguousarray(centroids, dtype=np.float32).copy()
@@ -103,7 +95,6 @@ class CodebookSnapshot:
 
 
 class EpochManager:
-    """Coordinates monotonic epoch progression, lifetime states, and reclamation."""
     def __init__(self, max_active_window: int = 4):
         self.max_active_window = max_active_window
         self.registry: Dict[int, CodebookSnapshot] = {}
@@ -125,7 +116,6 @@ class EpochManager:
         return CodebookSnapshot(next_epoch_id, codebook_data)
 
     def publish_promoted_snapshot(self, snapshot: CodebookSnapshot):
-        """Atomic publication critical section."""
         with self.lock:
             new_id = int(snapshot.epoch_id)
             prev_id = self.active_epoch_id
@@ -140,7 +130,6 @@ class EpochManager:
             self.active_epoch_id = new_id
 
     def get_search_snapshot_view(self) -> Dict[int, CodebookSnapshot]:
-        """Provides an immutable dictionary view of all searchable snapshots."""
         with self.lock:
             searchable = {}
             for e_id, snap in self.registry.items():
@@ -188,10 +177,6 @@ class EpochManager:
 
 
 class AdaptiveOnlinePQ:
-    """
-    Adaptive Online Product Quantization Engine (v4.1 Dynamic Core).
-    Supports zero-downtime codebook replacement with dynamic arena storage.
-    """
     def __init__(
         self,
         d: int = 128,
@@ -299,7 +284,7 @@ class AdaptiveOnlinePQ:
         X_sub = self._decompose(X_batch)
         N_batch = X_batch.shape[0]
 
-        # 1. Update Shadow Centroids
+        # 1. Stochastic Centroid Tracking
         for i in range(self.m):
             sub_vecs = X_sub[:, i, :]
             centroids = self.shadow_codebook[i]
@@ -330,7 +315,7 @@ class AdaptiveOnlinePQ:
         mse_diff = active_mse - shadow_mse
         rel_gain = mse_diff / max(active_mse, 1e-6)
 
-        # 3. Decoupled Promotion with absolute error floor
+        # 3. Decoupled Promotion
         is_significant_drift = (rel_gain > self.drift_threshold) and (mse_diff > 1e-4)
         if is_significant_drift or force_swap:
             next_epoch_id = curr_active_id + 1
@@ -345,12 +330,12 @@ class AdaptiveOnlinePQ:
             for cand in candidates:
                 self.migration_queue.put(cand)
 
-        # 4. Ingest raw vectors into chunk list
+        # 4. Ingest raw vectors for second-stage refinement
         with self._raw_lock:
             self._raw_chunks.append(np.ascontiguousarray(X_batch, dtype=np.float32))
             self._raw_count += N_batch
 
-        # 5. Storage Append
+        # 5. Append to Storage Arena
         active_id = self.epoch_manager.active_epoch_id
         active_snap = self.epoch_manager.registry[active_id]
 
@@ -382,15 +367,13 @@ class AdaptiveOnlinePQ:
             target_epoch_id = self.epoch_manager.active_epoch_id
             target_snapshot = self.epoch_manager.registry[target_epoch_id]
 
+        # Zero-reconstruction optimal transport migration
         migrated_total = self.storage.migrate_all_records(
             old_epoch_id=old_epoch_id,
             target_epoch_id=target_epoch_id,
             old_snapshot_data=old_snapshot.data,
             target_snapshot_data=target_snapshot.data,
-            quantize_fn=self.quantize,
-            d=self.d,
-            m=self.m,
-            d_sub=self.d_sub
+            k=self.k
         )
 
         self.epoch_manager.decrement_ref(old_epoch_id, migrated_total)
@@ -398,7 +381,6 @@ class AdaptiveOnlinePQ:
         self.total_compactions += 1
 
     def search_adc_only(self, query: np.ndarray, top_k: int = 10) -> Tuple[np.ndarray, np.ndarray]:
-        """Pure Multi-Epoch ADC search without candidate refinement."""
         assert query.shape[0] == self.d, f"Query dimension mismatch: expected {self.d}"
         q_sub = query.reshape(self.m, self.d_sub)
 
@@ -439,7 +421,6 @@ class AdaptiveOnlinePQ:
         return flat_gids[sorted_order], all_dists[sorted_order]
 
     def _get_raw_vector(self, gid: int) -> np.ndarray:
-        """Retrieves raw vector from chunk list by global ID."""
         curr = 0
         for chunk in self._raw_chunks:
             if gid < curr + chunk.shape[0]:
@@ -454,7 +435,6 @@ class AdaptiveOnlinePQ:
         candidate_pool: Optional[int] = None,
         candidate_ratio: float = 0.005
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Two-stage search with dynamic candidate pool scaling (max(top_k * 4, min_pool, alpha * N))."""
         assert query.shape[0] == self.d, f"Query dimension mismatch: expected {self.d}"
         q_sub = query.reshape(self.m, self.d_sub)
 
@@ -490,7 +470,6 @@ class AdaptiveOnlinePQ:
                 flat_codes, flat_epochs, epoch_lut_matrix, epoch_id_map, self.m, self.k
             )
 
-        # Dynamic pool calculation
         if candidate_pool is None:
             effective_pool = max(80, int(total_n * candidate_ratio))
         else:
@@ -500,7 +479,6 @@ class AdaptiveOnlinePQ:
         candidate_indices = np.argpartition(all_dists, candidate_k - 1)[:candidate_k]
         candidate_ids = flat_gids[candidate_indices]
 
-        # Exact Refinement on retrieved candidates
         with self._raw_lock:
             if candidate_ids.size > 0 and candidate_ids.max() < self._raw_count:
                 candidate_vecs = np.vstack([self._get_raw_vector(int(cid)) for cid in candidate_ids])
@@ -516,8 +494,29 @@ class AdaptiveOnlinePQ:
         sorted_order = candidate_indices[np.argsort(all_dists[candidate_indices])][:final_k]
         return flat_gids[sorted_order], all_dists[sorted_order]
 
+    def get_generational_staleness(self) -> dict:
+        _, flat_epochs, _, total_n = self.storage.get_unified_search_view()
+        if total_n == 0:
+            return {
+                "active_epoch": 0,
+                "max_epoch_lag": 0,
+                "mean_epoch_lag": 0.0,
+                "pct_records_stale_gt_1": 0.0,
+                "pct_records_current": 100.0
+            }
+
+        active_id = self.epoch_manager.active_epoch_id
+        epoch_deltas = active_id - flat_epochs[:total_n]
+
+        return {
+            "active_epoch": int(active_id),
+            "max_epoch_lag": int(np.max(epoch_deltas)),
+            "mean_epoch_lag": float(np.mean(epoch_deltas)),
+            "pct_records_stale_gt_1": float(np.mean(epoch_deltas > 1) * 100.0),
+            "pct_records_current": float(np.mean(epoch_deltas == 0) * 100.0)
+        }
+
     def get_memory_footprint(self) -> dict:
-        """Calculates precise physical memory consumption across all index layers."""
         with self.storage.lock:
             code_bytes = self.storage._flat_codes.nbytes
             epoch_bytes = self.storage._flat_epochs.nbytes

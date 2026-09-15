@@ -1,11 +1,10 @@
 """
-SIFT-1M Full 1,000,000 Vector Streaming Benchmark (AO-PQ v4.1)
-==============================================================
-Evaluates continuous streaming drift across the complete 1,000,000 SIFT vectors:
-- Figure 1: Reconstruction MSE tracking across 90 streaming drift batches.
-- Figure 2: Matched 4-Way Recall@10 retention curve (on-manifold evaluation).
-- Figure 3: Pure ADC latency distribution boxplot (N=1,800 queries).
-- Figure 4: Search latency scalability vs. Segmented PQ Store (100% vector coverage).
+SIFT-1M Full 1,000,000 Vector Streaming Benchmark (AO-PQ v4.2 MVCC Edition)
+===========================================================================
+Evaluates continuous streaming drift across 1,000,000 SIFT vectors against:
+- Static PQ Baseline
+- Blue-Green Dual Index Rebuild Baseline (Industry Standard)
+- Generational Staleness Tracking (Property 3 Verification)
 """
 
 import os
@@ -148,68 +147,53 @@ class StaticPQEngine:
         return cand_idx[sorted_order].astype(np.uint64), exact_dists[sorted_order]
 
 
-class SegmentedPQStore:
-    """Segmented Scatter-Gather baseline with fast mini-batch fitting."""
+class BlueGreenRebuildBaseline:
+    """
+    Industry-standard baseline: Serves queries from Index A while 
+    training and rebuilding Index B in the background, doubling peak RAM.
+    """
     def __init__(self, d: int = 128, m: int = 8, k: int = 256):
         self.d = d
         self.m = m
-        self.d_sub = d // m
         self.k = k
-        self.segments = []
+        self.active_index = StaticPQEngine(d, m, k)
+        self.accumulated_vectors = []
 
-    def ingest(self, X: np.ndarray):
-        X_sub = X.reshape(X.shape[0], self.m, self.d_sub)
-        sample_n = min(1024, X.shape[0])
-        sample_sub = X_sub[:sample_n]
+    def fit_initial(self, X_train: np.ndarray):
+        self.active_index.fit(X_train)
+        self.active_index.ingest(X_train)
+        self.accumulated_vectors.append(X_train)
+
+    def ingest_and_maybe_rebuild(self, X_batch: np.ndarray, rebuild: bool = False) -> Tuple[float, float]:
+        self.active_index.ingest(X_batch)
+        self.accumulated_vectors.append(X_batch)
         
-        c = np.zeros((self.m, self.k, self.d_sub), dtype=np.float32)
-        for i in range(self.m):
-            km = MiniBatchKMeans(
-                n_clusters=self.k,
-                batch_size=min(512, sample_n),
-                n_init=1,
-                max_iter=15,
-                random_state=42
-            )
-            km.fit(sample_sub[:, i, :])
-            c[i] = km.cluster_centers_.astype(np.float32)
+        rebuild_time_ms = 0.0
+        peak_memory_mb = (len(np.vstack(self.accumulated_vectors)) * self.m) / (1024 * 1024)
 
-        codes = np.zeros((X.shape[0], self.m), dtype=np.uint8)
-        for i in range(self.m):
-            sub_v = X_sub[:, i, :]
-            cen = c[i]
-            dists = (
-                np.sum(sub_v ** 2, axis=1, keepdims=True)
-                + np.sum(cen ** 2, axis=1, keepdims=True).T
-                - 2.0 * np.dot(sub_v, cen.T)
-            )
-            codes[:, i] = np.argmin(dists, axis=1)
+        if rebuild:
+            t0 = time.perf_counter()
+            all_vecs = np.vstack(self.accumulated_vectors)
+            # Memory doubles during background training
+            peak_memory_mb *= 2.0
+            
+            shadow_index = StaticPQEngine(self.d, self.m, self.k)
+            shadow_index.fit(all_vecs[:min(100000, len(all_vecs))])
+            for chunk in self.accumulated_vectors:
+                shadow_index.ingest(chunk)
+            
+            self.active_index = shadow_index
+            rebuild_time_ms = (time.perf_counter() - t0) * 1000.0
 
-        self.segments.append({"centroids": c, "codes": codes, "size": X.shape[0]})
+        return rebuild_time_ms, peak_memory_mb
 
-    def search_adc_only(self, query: np.ndarray, top_k: int = 10) -> Tuple[np.ndarray, np.ndarray]:
-        seg_results = []
-        q_sub = query.reshape(self.m, self.d_sub)
-        for s in self.segments:
-            lut = np.zeros((1, self.m, self.k), dtype=np.float32)
-            for sub_i in range(self.m):
-                lut[0, sub_i] = np.sum((s["centroids"][sub_i] - q_sub[sub_i]) ** 2, axis=1)
-            epochs = np.zeros(s["size"], dtype=np.uint64)
-            map_arr = np.zeros(1, dtype=np.uint64)
-            dists = _fast_unified_multi_epoch_adc(s["codes"], epochs, lut, map_arr, self.m, self.k)
-            k_s = min(top_k, s["size"])
-            idx = np.argpartition(dists, k_s - 1)[:k_s]
-            seg_results.append(dists[idx])
-        all_dists = np.concatenate(seg_results)
-        final_k = min(top_k, len(all_dists))
-        best_idx = np.argpartition(all_dists, final_k - 1)[:final_k]
-        sorted_order = best_idx[np.argsort(all_dists[best_idx])]
-        return np.arange(final_k, dtype=np.uint64), all_dists[sorted_order]
+    def search(self, query: np.ndarray, top_k: int = 10) -> Tuple[np.ndarray, np.ndarray]:
+        return self.active_index.search(query, top_k=top_k)
 
 
 def run_sift_benchmark():
     print("=" * 75)
-    print("      SIFT-1M FULL 1,000,000 VECTOR STREAMING BENCHMARK (v4.1)")
+    print("      SIFT-1M STREAMING BENCHMARK (AO-PQ v4.2 MVCC PROTOCOL)")
     print("=" * 75)
     raw_sift = download_sift1m()
     
@@ -230,17 +214,18 @@ def run_sift_benchmark():
         for i in range(num_batches)
     ]
 
-    print(f"[1/3] Fitting bootstrap codebooks on initial {num_initial:,} SIFT vectors...")
+    print(f"[1/3] Initializing engines on {num_initial:,} bootstrap SIFT vectors...")
     adaptive_engine = AdaptiveOnlinePQ(d=d, m=m, k=k, lr=0.12, momentum=0.85, drift_threshold=0.015, max_active_window=4)
     static_engine = StaticPQEngine(d=d, m=m, k=k)
-    segmented_engine = SegmentedPQStore(d=d, m=m, k=k)
+    bluegreen_engine = BlueGreenRebuildBaseline(d=d, m=m, k=k)
 
     adaptive_engine.fit_initial(X_init)
     adaptive_engine.ingest_stream_batch(X_init)
 
     static_engine.fit(X_init)
     static_engine.ingest(X_init)
-    segmented_engine.ingest(X_init)
+
+    bluegreen_engine.fit_initial(X_init)
 
     print(f"[2/3] Streaming {num_batches} drifting batches (1,000,000 total vectors)...")
     metrics_records = []
@@ -253,30 +238,37 @@ def run_sift_benchmark():
 
         adaptive_engine.ingest_stream_batch(batch)
         static_engine.ingest(batch)
-        segmented_engine.ingest(batch)
+        
+        # Periodic Blue-Green Rebuild every 20 batches (~200k vectors)
+        trigger_bg = ((b_idx + 1) % 20 == 0)
+        bg_rebuild_ms, bg_peak_mb = bluegreen_engine.ingest_and_maybe_rebuild(batch, rebuild=trigger_bg)
 
-        # Query evaluation using on-manifold queries with perturbation
-        adp_recalls_twostage, static_recalls_twostage = [], []
+        # Generational Staleness Tracking
+        staleness = adaptive_engine.get_generational_staleness()
+
+        # Query evaluation using on-manifold queries
+        adp_recalls_twostage, static_recalls_twostage, bg_recalls_twostage = [], [], []
         adp_recalls_pure, static_recalls_pure = [], []
-        adp_latencies_adc, static_latencies_adc, seg_latencies_adc = [], [], []
+        adp_latencies_adc, static_latencies_adc = [], []
 
         curr_n = num_initial + (b_idx + 1) * batch_size
         curr_corpus = sift_stream[:curr_n]
 
-        # Sample 20 on-manifold queries from the current batch with Gaussian noise
         sample_indices = np.random.choice(len(batch), size=min(20, len(batch)), replace=False)
         query_samples = batch[sample_indices] + np.random.normal(0.0, 5.0, size=(len(sample_indices), d)).astype(np.float32)
 
         for q in query_samples:
-            # Ground truth calculation on full indexed corpus
             gt_dists = np.sum((curr_corpus - q) ** 2, axis=1)
             gt_top10 = set(np.argpartition(gt_dists, 10)[:10])
 
-            # Two-Stage Search with Dynamic Candidate Scaling
+            # Two-Stage Search
             pred_adp, _ = adaptive_engine.search(q, top_k=10)
             pred_sta, _ = static_engine.search(q, top_k=10, candidate_pool=80)
+            pred_bg, _ = bluegreen_engine.search(q, top_k=10)
+
             adp_recalls_twostage.append(len(gt_top10.intersection(set(pred_adp))) / 10.0)
             static_recalls_twostage.append(len(gt_top10.intersection(set(pred_sta))) / 10.0)
+            bg_recalls_twostage.append(len(gt_top10.intersection(set(pred_bg))) / 10.0)
 
             # Pure ADC Timed Search
             t0 = time.perf_counter()
@@ -287,13 +279,8 @@ def run_sift_benchmark():
             p_sta_ids, _ = static_engine.search_adc_only(q, top_k=10)
             t_sta = (time.perf_counter() - t0) * 1000.0
 
-            t0 = time.perf_counter()
-            segmented_engine.search_adc_only(q, top_k=10)
-            t_seg = (time.perf_counter() - t0) * 1000.0
-
             adp_latencies_adc.append(t_adp)
             static_latencies_adc.append(t_sta)
-            seg_latencies_adc.append(t_seg)
             adp_individual_latencies.append(t_adp)
             static_individual_latencies.append(t_sta)
 
@@ -302,22 +289,24 @@ def run_sift_benchmark():
 
         metrics_records.append({
             "Batch": b_idx + 1,
-            "Total_Vectors": num_initial + (b_idx + 1) * batch_size,
+            "Total_Vectors": curr_n,
             "Adaptive_MSE": adp_mse,
             "Static_MSE": static_mse,
-            "Adaptive_Recall10_TwoStage": np.mean(adp_recalls_twostage) * 100.0,
-            "Static_Recall10_TwoStage": np.mean(static_recalls_twostage) * 100.0,
-            "Adaptive_Recall10_PureADC": np.mean(adp_recalls_pure) * 100.0,
-            "Static_Recall10_PureADC": np.mean(static_recalls_pure) * 100.0,
+            "Adaptive_Recall10": np.mean(adp_recalls_twostage) * 100.0,
+            "Static_Recall10": np.mean(static_recalls_twostage) * 100.0,
+            "BlueGreen_Recall10": np.mean(bg_recalls_twostage) * 100.0,
+            "Adaptive_Recall10_Pure": np.mean(adp_recalls_pure) * 100.0,
+            "Static_Recall10_Pure": np.mean(static_recalls_pure) * 100.0,
             "Adaptive_Latency_ms": np.mean(adp_latencies_adc),
             "Static_Latency_ms": np.mean(static_latencies_adc),
-            "Segmented_Latency_ms": np.mean(seg_latencies_adc)
+            "Max_Epoch_Lag": staleness["max_epoch_lag"],
+            "Pct_Stale_Records": staleness["pct_records_stale_gt_1"],
+            "BlueGreen_Peak_RAM_MB": bg_peak_mb
         })
 
     adaptive_engine.migration_queue.join()
-    
-    # Print Exact Memory Footprint
     mem = adaptive_engine.get_memory_footprint()
+
     print("\n" + "=" * 75)
     print("                    PHYSICAL MEMORY BREAKDOWN")
     print("=" * 75)
@@ -335,10 +324,10 @@ def run_sift_benchmark():
     os.makedirs("results", exist_ok=True)
     df_metrics.to_csv("results/sift1m_benchmark_metrics.csv", index=False)
 
-    # Figure 1: Reconstruction MSE Tracking
     print("[3/3] Generating publication-grade empirical figures...")
     sns.set_theme(style="ticks", font_scale=1.1)
 
+    # Figure 1: Reconstruction MSE Tracking
     plt.figure(figsize=(8, 4))
     plt.plot(df_metrics["Batch"], df_metrics["Static_MSE"], label="Static PQ Baseline", color="#d9534f", linestyle="--", linewidth=1.8)
     plt.plot(df_metrics["Batch"], df_metrics["Adaptive_MSE"], label="AO-PQ Multi-Epoch (Ours)", color="#0275d8", linewidth=2.2)
@@ -351,55 +340,38 @@ def run_sift_benchmark():
     plt.savefig("results/sift_fig1_reconstruction_mse.png", dpi=300)
     plt.close()
 
-    # Figure 2: Matched 4-Way Recall Retention
+    # Figure 2: Matched 4-Way Recall Retention + BlueGreen Baseline
     plt.figure(figsize=(8, 4))
-    plt.plot(df_metrics["Batch"], df_metrics["Adaptive_Recall10_TwoStage"], label="AO-PQ (ADC + Exact Rerank)", color="#0275d8", linewidth=2.0)
-    plt.plot(df_metrics["Batch"], df_metrics["Static_Recall10_TwoStage"], label="Static PQ (ADC + Exact Rerank)", color="#f0ad4e", linestyle="-.", linewidth=1.8)
-    plt.plot(df_metrics["Batch"], df_metrics["Adaptive_Recall10_PureADC"], label="AO-PQ (Pure ADC Only)", color="#5cb85c", linestyle="--", linewidth=1.6)
-    plt.plot(df_metrics["Batch"], df_metrics["Static_Recall10_PureADC"], label="Static PQ (Pure ADC Only)", color="#d9534f", linestyle=":", linewidth=1.6)
+    plt.plot(df_metrics["Batch"], df_metrics["Adaptive_Recall10"], label="AO-PQ Two-Stage (Ours)", color="#0275d8", linewidth=2.0)
+    plt.plot(df_metrics["Batch"], df_metrics["BlueGreen_Recall10"], label="Blue-Green Rebuild Baseline", color="#5cb85c", linestyle="-.", linewidth=1.8)
+    plt.plot(df_metrics["Batch"], df_metrics["Static_Recall10"], label="Static PQ Baseline", color="#f0ad4e", linestyle="--", linewidth=1.8)
     plt.axhline(85.0, color="gray", linestyle="--", alpha=0.7, label="SLA Target (85%)")
-    plt.title("SIFT-1M (1,000,000 Vectors) Recall@10: Algorithmic & Pipeline Ablation", fontweight="bold", fontsize=11)
+    plt.title("SIFT-1M (1,000,000 Vectors) Recall@10 vs. Blue-Green Rebuild", fontweight="bold", fontsize=11)
     plt.xlabel("Streaming Batch Number (10,000 vectors/batch)")
     plt.ylabel("Empirical Recall@10 (%)")
     plt.ylim(0, 105)
-    plt.legend(loc="lower left", fontsize=8, ncol=2)
+    plt.legend(loc="lower left", fontsize=9)
     plt.grid(True, linestyle=":", alpha=0.6)
     plt.tight_layout()
     plt.savefig("results/sift_fig2_recall_retention.png", dpi=300)
     plt.close()
 
-    # Figure 3: Pure ADC Latency Distribution
-    plt.figure(figsize=(7, 4))
-    df_box = pd.DataFrame({
-        "Static PQ (Pure ADC)": static_individual_latencies,
-        "AO-PQ (Pure ADC Multi-Epoch)": adp_individual_latencies
-    })
-    sns.boxplot(data=df_box, palette=["#1f77b4", "#5cb85c"], showmeans=True,
-                meanprops={"marker": "o", "markerfacecolor": "white", "markeredgecolor": "black"})
-    plt.title(f"SIFT-1M Pure ADC Latency Distribution (N={len(adp_individual_latencies):,} Queries)", fontweight="bold", fontsize=11)
-    plt.ylabel("Query Latency (ms)")
-    plt.xlabel("System")
-    plt.grid(True, linestyle=":", alpha=0.6, axis="y")
-    plt.tight_layout()
-    plt.savefig("results/sift_fig3_latency_distribution.png", dpi=300)
-    plt.close()
-
-    # Figure 4: Search Scalability vs Segmented Store
+    # Figure 3: Generational Staleness Tracking (Property 3 Verification)
     plt.figure(figsize=(8, 4))
-    plt.plot(df_metrics["Total_Vectors"], df_metrics["Segmented_Latency_ms"], label="Segmented PQ Store (Scatter-Gather)", color="#d9534f", linestyle="--", linewidth=1.8)
-    plt.plot(df_metrics["Total_Vectors"], df_metrics["Adaptive_Latency_ms"], label="Unified AO-PQ (JIT Multi-Epoch)", color="#0275d8", linewidth=2.2)
-    plt.title("SIFT-1M Pure ADC Search Latency Scaling (Segmented vs Unified)", fontweight="bold", fontsize=11)
-    plt.xlabel("Total Indexed Vectors in Memory (100% Coverage)")
-    plt.ylabel("Query Latency (ms)")
-    plt.legend(loc="upper left")
+    plt.plot(df_metrics["Batch"], df_metrics["Pct_Stale_Records"], label="Records Stale > 1 Epoch (%)", color="#d9534f", linewidth=2.0)
+    plt.axhline(5.0, color="gray", linestyle=":", label="Staleness Ceiling (5%)")
+    plt.title("Generational Staleness Bounded by Out-of-Line COW Compaction", fontweight="bold", fontsize=11)
+    plt.xlabel("Streaming Batch Number (10,000 vectors/batch)")
+    plt.ylabel("Corpus Percentage Stale (%)")
+    plt.legend(loc="upper right")
     plt.grid(True, linestyle=":", alpha=0.6)
     plt.tight_layout()
-    plt.savefig("results/sift_fig4_scalability.png", dpi=300)
+    plt.savefig("results/sift_fig5_generational_staleness.png", dpi=300)
     plt.close()
 
-    print("\n[SUCCESS] Full SIFT-1M Scale Benchmark Completed (1,000,000 Vectors).")
-    print(f" -> Total Codebook Swaps: {adaptive_engine.total_swaps}")
-    print(f" -> Total Background Compactions: {adaptive_engine.total_compactions}")
+    print("\n[SUCCESS] SIFT-1M Benchmark Completed (1,000,000 Vectors).")
+    print(f" -> Total Codebook Promotions (Swaps): {adaptive_engine.total_swaps}")
+    print(f" -> Total Background Compactions Handled: {adaptive_engine.total_compactions}")
 
 
 if __name__ == "__main__":

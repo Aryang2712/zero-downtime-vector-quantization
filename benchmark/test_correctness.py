@@ -1,8 +1,8 @@
 """
-AO-PQ v4.1 Comprehensive Architectural & System Invariant Audit Suite
+AO-PQ v4.3 Comprehensive Architectural & System Invariant Audit Suite
 =====================================================================
 Validates all 17 fundamental systems invariants across concurrency,
-memory safety, monotonic progression, and distance precision.
+memory safety, zero-reconstruction migration, and distance precision.
 """
 
 import os
@@ -17,7 +17,7 @@ from src.engine import AdaptiveOnlinePQ, CodebookSnapshot, EpochState
 
 def run_comprehensive_audit():
     print("=" * 75)
-    print("      AO-PQ v4.1 COMPREHENSIVE ARCHITECTURAL & INVARIANT AUDIT")
+    print("      AO-PQ v4.3 COMPREHENSIVE ARCHITECTURAL & INVARIANT AUDIT")
     print("=" * 75)
     np.random.seed(42)
 
